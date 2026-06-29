@@ -67,6 +67,13 @@ static int sfgmac_set_delay_from_nvmem(struct sf19a2890_gmac_priv *priv)
 	if (ret == 0) {
 		delay_tx = (gmac_delay >> 8) & 0xff;
 		delay_rx = gmac_delay & 0xff;
+		/* Mainline drives the GSW150 CPU port with no switch-side RGMII
+		 * delay (phy-mode rgmii), so the gmac RX must supply the full
+		 * delay. The vendor per-unit RX cal assumed switch-side delay and
+		 * is too small alone (TX path works, RX path is dead). Use the
+		 * proven TX delay for RX too. */
+		if (delay_rx < delay_tx)
+			delay_rx = delay_tx;
 		writel(delay_tx, priv->gmac_cfg + REG_CLK_TX_DELAY);
 		writel(delay_rx, priv->gmac_cfg + REG_CLK_RX_PHY_DELAY);
 		if (delay_rx)
