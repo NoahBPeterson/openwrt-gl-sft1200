@@ -1,0 +1,328 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/dts-v1/;
+
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/clock/siflower,sf19a2890-clk.h>
+#include "sf19a2890.dtsi"
+
+/ {
+	model = "GL.iNet GL-SFT1200";
+	compatible = "glinet,gl-sft1200", "siflower,sf19a2890";
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		/* attach the NAND "ubi" partition so the squashfs-on-UBI rootfs
+		 * (rootfs + rootfs_data volumes) mounts on a flashed install */
+		bootargs = "earlycon ubi.mtd=ubi";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x8000000>; /* 128 MB DDR3 */
+	};
+
+	keys {
+		compatible = "gpio-keys";
+
+		reset {
+			label = "reset";
+			gpios = <&gpio 27 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RESTART>;
+		};
+
+		mode {
+			label = "mode";
+			gpios = <&gpio 1 GPIO_ACTIVE_LOW>;
+			linux,code = <BTN_0>;
+		};
+	};
+
+	/*
+	 * External switch: MaxLinear GSW150 / Lantiq PEB7084 (== vendor "intel7084").
+	 * CONFIRMED on hardware: GSWIP version reg 0xfa11 reads 0x2003 over the
+	 * GPIO bit-banged MDIO bus (gswprobe). Driven by the upstream DSA driver
+	 * mxl-gsw1xx (backported from torvalds/master to 6.12).
+	 *
+	 * Bus: standard Linux mdio-gpio bit-bang on GPIO28(MDC)/GPIO29(MDIO) -- the
+	 * exact transport the vendor sf_eswitch used (virtual,mdio-gpio + SMDIO
+	 * indirect; NOT the SoC dwmac-mdio, NOT Realtek SMI). The switch sits at
+	 * SMDIO addr 0 (gsw_mdio_addr[0]=0). GMAC drops &mdio_pins so 28/29 stay
+	 * free for the bit-bang; GPIO0 hog (below) releases the GSW150 reset.
+	 *
+	 * Topology (gsw150_data.allowed_cpu_ports = BIT(5)|BIT(6); MII_PORT=5):
+	 *   port 0 = wan, port 1 = lan1, port 2 = lan2 (integrated PHYs),
+	 *   port 5 = RGMII CPU port -> &gmac conduit.
+	 */
+	mdio_gpio: mdio {
+		compatible = "virtual,mdio-gpio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		gpios = <&gpio 28 GPIO_ACTIVE_HIGH>,	/* MDC  */
+			<&gpio 29 GPIO_ACTIVE_HIGH>;	/* MDIO */
+
+		switch@0 {
+			compatible = "lantiq,peb7084";
+			reg = <0>;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					label = "wan";
+					phy-handle = <&switchphy0>;
+					phy-mode = "internal";
+				};
+				port@1 {
+					reg = <1>;
+					label = "lan1";
+					phy-handle = <&switchphy1>;
+					phy-mode = "internal";
+				};
+				port@2 {
+					reg = <2>;
+					label = "lan2";
+					phy-handle = <&switchphy2>;
+					phy-mode = "internal";
+				};
+				port@5 {
+					reg = <5>;
+					ethernet = <&gmac>;
+					/*
+					 * RGMII delay ownership: the SoC gmac glue
+					 * (dwmac-sf19a2890) programs factory-calibrated
+					 * TX+RX taps and the &gmac node is "rgmii-id".
+					 * The mxl-gsw1xx driver ALSO defaults the switch
+					 * PCDU to 2ns TX + 2ns RX, which stacked on top of
+					 * the SoC delay (double-delay) and broke the
+					 * switch->gmac return path: port1 RxGoodPkts rose
+					 * but eth0 RX stayed 0 with zero CRC errors (severe
+					 * RGMII RX mis-timing -> no valid SFD -> silently
+					 * dropped). Diagnosed live via debugfs regmap +
+					 * per-port ethtool MIB. Fix: switch adds ZERO delay
+					 * (both internal-delay-ps = 0); the SoC gmac owns
+					 * the timing, restoring the unmanaged-build profile.
+					 */
+					phy-mode = "rgmii";
+					tx-internal-delay-ps = <0>;
+					rx-internal-delay-ps = <0>;
+					fixed-link {
+						speed = <1000>;
+						full-duplex;
+					};
+				};
+			};
+
+			/* integrated port-PHYs, reached via the GSWIP internal MDIO */
+			mdio {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				switchphy0: ethernet-phy@0 { reg = <0>; };
+				switchphy1: ethernet-phy@1 { reg = <1>; };
+				switchphy2: ethernet-phy@2 { reg = <2>; };
+			};
+		};
+	};
+
+	/*
+	 * Wi-Fi MAC engines. Driver (sf_smac/siwifi) of_match = siflower,sf19a2890-{lb,hb};
+	 * it requests reset-names "wlan_reset"/"iram_reset" and uses interrupt index 1 as
+	 * the UMAC irq. reg/interrupts/smp-affinity are the authoritative values read from
+	 * the live unit's device tree (independently re-confirmed: lb irq 90/89 aff 2,
+	 * hb irq 186/185 aff 3, rf irq 187).
+	 *
+	 * CLOCKS: the fmac driver does devm_clk_bulk_get_all() then bulk-enables
+	 * every clock in this node (it never indexes them by name). It needs both
+	 * the 3 AXI gates (wlan24clk/wlan5clk axis/axim/plf, in the periph CRM at
+	 * 0x19e08004 / 0x19e0c404) AND the 5 functional clocks the vendor binds --
+	 * wlan_mac_wt, bus2, m_SFDSP (DSP), wlan5_mac_wt, bus3. Those 5 all live in
+	 * the MAIN clk controller (&clk @ 0x19e01000) and mainline already models
+	 * them: m_SFDSP_0/1 @ 0x19e01680/0x19e016a0 == CLK_MUXDIV_M6250_0/1 (same
+	 * register, just named "m6250"); wlan24/5_mac_wt @ 0x19e016c0/e0 ==
+	 * CLK_MUXDIV_WLAN24/5_PLF; bus2/bus3 @ 0x19e01420/40 == CLK_MUXDIV_BUS2/3
+	 * (already CLK_IS_CRITICAL). Our earlier 3-AXI-only DT let the driver probe
+	 * but HUNG the SoC at HB firmware-load because the DSP (m_SFDSP) was
+	 * unclocked -> bus wedge. Listing all 8 below fixes it (also satisfies the
+	 * driver's >=8 clock count check in siwifi_mpw0.c).
+	 */
+	wifi_lb: wifi-lb@11000000 {
+		compatible = "siflower,sf19a2890-lb";
+		reg = <0x11000000 0x400000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SHARED 90 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SHARED 89 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&wlan24clk 0>, <&wlan24clk 1>, <&wlan24clk 2>,
+			 <&clk CLK_MUXDIV_WLAN24_PLF>,	/* wlan_clk (wlan24 mac_wt) */
+			 <&clk CLK_MUXDIV_BUS2>,	/* bus2_clk */
+			 <&clk CLK_MUXDIV_M6250_0>,	/* m_SFDSPclk (DSP, lb == vendor m_SFDSP_0) */
+			 <&clk CLK_MUXDIV_WLAN5_PLF>,	/* wlan5_clk */
+			 <&clk CLK_MUXDIV_BUS3>;	/* bus3_clk */
+		clock-names = "wlan_axis", "wlan_axim", "wlan_plf",
+			      "wlan_clk", "bus2_clk", "m_SFDSPclk",
+			      "wlan5_clk", "bus3_clk";
+		resets = <&wlan24rst 0>, <&wlan24rst 1>;
+		reset-names = "wlan_reset", "iram_reset";
+		smp-affinity = <2>;
+		status = "okay";
+	};
+
+	wifi_hb: wifi-hb@17800000 {
+		compatible = "siflower,sf19a2890-hb";
+		reg = <0x17800000 0x400000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SHARED 186 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SHARED 185 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&wlan5clk 0>, <&wlan5clk 1>, <&wlan5clk 2>,
+			 <&clk CLK_MUXDIV_WLAN5_PLF>,	/* wlan_clk (wlan5 mac_wt) */
+			 <&clk CLK_MUXDIV_BUS3>,	/* bus3_clk */
+			 <&clk CLK_MUXDIV_M6250_1>,	/* m_SFDSPclk (DSP, hb == vendor m_SFDSP_1) */
+			 <&clk CLK_MUXDIV_WLAN24_PLF>,	/* wlan24_clk */
+			 <&clk CLK_MUXDIV_BUS2>;	/* bus2_clk */
+		clock-names = "wlan_axis", "wlan_axim", "wlan_plf",
+			      "wlan_clk", "bus3_clk", "m_SFDSPclk",
+			      "wlan24_clk", "bus2_clk";
+		resets = <&wlan5rst 0>, <&wlan5rst 1>;
+		reset-names = "wlan_reset", "iram_reset";
+		smp-affinity = <3>;
+		status = "okay";
+	};
+};
+
+/*
+ * GPIO0 = switch reset (vendor U-Boot: "trigger eswitch hw reset, gpio:0").
+ * Proven active-low on hardware: line LOW -> MDIO reads 0xffff (chip floating/
+ * in reset), line HIGH -> chip responds. Hog it HIGH so the chip is released
+ * before the mdio-gpio bus scans at boot (otherwise the scan finds nothing).
+ */
+&gpio {
+	eswitch_reset_hog {
+		gpio-hog;
+		gpios = <0 0>;
+		output-high;
+		line-name = "eswitch-reset-release";
+	};
+};
+
+&gmac {
+	status = "okay";
+	phy-mode = "rgmii-id";
+	snps,ps-speed = <1000>;
+	/*
+	 * Drop &mdio_pins (kept rgmii_pins only): the GSW150 is on the GPIO
+	 * bit-bang MDIO (mdio_gpio), not the hardware dwmac-mdio, so GPIO28/29 must
+	 * stay free. The dwmac MDIO bus is left unused.
+	 */
+	pinctrl-names = "default";
+	pinctrl-0 = <&rgmii_pins>;
+	nvmem-cells = <&macaddr_factory_0>, <&rgmii_delay_factory_b2>;
+	nvmem-cell-names = "mac-address", "rgmii-delay";
+
+	/*
+	 * The dwmac HW-feature register reports FIFO size 0, so stmmac computes
+	 * txfifosz=0 and rejects any MTU change (incl. the +8 DSA tag) with -EINVAL.
+	 * stmmac_platform reads "tx-fifo-depth"/"rx-fifo-depth" (NOT snps,*-fifo-size)
+	 * into plat->{tx,rx}_fifo_size; change_mtu divides by tx_queues_to_use (=1
+	 * here). Declare 4096: vendor g-tx-fifo-size sums to 3584 (only fits 4096),
+	 * dma_cap confirms RXFIFO > 2048.
+	 */
+	tx-fifo-depth = <4096>;
+	rx-fifo-depth = <4096>;
+
+	fixed-link {
+		speed = <1000>;
+		full-duplex;
+		pause;
+	};
+};
+
+/* RF front-end (upstream node) — the siwifi RF driver binds here. */
+&wlan_rf {
+	status = "okay";
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&usb {
+	status = "okay";
+};
+
+&usb_phy {
+	status = "okay";
+};
+
+&spi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "spi-nand";
+		reg = <0>;
+		spi-max-frequency = <30000000>;
+
+		/*
+		 * Verified flash layout from the live unit (/proc/mtd). The vendor
+		 * "firmware" region is a kernel(4M) + UBI(rest) split — modelled here
+		 * as two partitions so OpenWrt boots the kernel raw and mounts rootfs
+		 * from the UBI volume.
+		 */
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "spl-loader";
+				reg = <0x0 0x20000>;
+				read-only;
+			};
+
+			partition@20000 {
+				label = "u-boot";
+				reg = <0x20000 0x60000>;
+			};
+
+			partition@80000 {
+				label = "u-boot-env";
+				reg = <0x80000 0x20000>;
+			};
+
+			factory: partition@a0000 {
+				label = "factory";
+				reg = <0xa0000 0x20000>;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					macaddr_factory_0: macaddr@0 {
+						reg = <0x0 0x6>;
+					};
+
+					rgmii_delay_factory_b2: rgmii-delay@b2 {
+						reg = <0xb2 0x4>;
+					};
+				};
+			};
+
+			partition@c0000 {
+				label = "kernel";
+				reg = <0xc0000 0x400000>; /* 4 MB raw kernel */
+			};
+
+			partition@4c0000 {
+				label = "ubi";
+				reg = <0x4c0000 0x7940000>; /* rootfs + overlay (UBI) */
+			};
+
+			partition@7e00000 {
+				label = "log";
+				reg = <0x7e00000 0x40000>;
+			};
+		};
+	};
+};
