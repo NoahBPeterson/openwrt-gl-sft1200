@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 ARCH:=mipsel
 BOARD:=siflower
 BOARDNAME:=Siflower SoCs
-FEATURES:=squashfs usb usbgadget
+FEATURES:=squashfs usb usbgadget nand
 SUBTARGETS:=sf19a2890 sf21
 
 KERNEL_PATCHVER:=6.12

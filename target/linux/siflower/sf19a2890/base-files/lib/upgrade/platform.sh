@@ -1,22 +1,10 @@
-PART_NAME=firmware
 REQUIRE_IMAGE_METADATA=1
 
 platform_check_image() {
-	local board=$(board_name)
-
-	case "$board" in
-	*)
-		return 0
-		;;
-	esac
+	return 0
 }
 
 platform_do_upgrade() {
-	local board=$(board_name)
-
-	case "$board" in
-	*)
-		default_do_upgrade "$1"
-		;;
-	esac
+	# raw "kernel" mtd + UBI "ubi" mtd (names match nand.sh CI_KERNPART/CI_UBIPART defaults)
+	nand_do_upgrade "$1"
 }
