@@ -135,6 +135,17 @@ export default {
 		// which saved config is active (last set)?
 		let group_id = c.get(STORE, "state", "group_id") ?? "";
 		let peer_id  = c.get(STORE, "state", "peer_id") ?? "";
+		// If nothing is active, report the FIRST saved config as the selected one so the
+		// app's "Enable" toggle has a group_id/peer_id to start (the app reads them from
+		// get_status and errors "group id and peer id is empty!" on 0/0). status stays 0.
+		if (group_id == "" || peer_id == "") {
+			group_id = ""; peer_id = "";
+			c.foreach(STORE, "peers", function(s) {
+				if (group_id == "" && s.group_id != null && s.peer_id != null) {
+					group_id = `${s.group_id}`; peer_id = `${s.peer_id}`;
+				}
+			});
+		}
 		let p = (group_id != "" && peer_id != "") ? load_peer(c, group_id, peer_id) : null;
 		let ep = split_endpoint(p ? p.end_point : "");
 

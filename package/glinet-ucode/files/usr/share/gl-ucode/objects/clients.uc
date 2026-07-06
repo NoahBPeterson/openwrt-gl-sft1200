@@ -133,8 +133,36 @@ function enrich(rec, w) {
 		rec.iface = "cable";
 		rec.total_rx = 0; rec.total_tx = 0;
 	}
-	rec.rx = 0; rec.tx = 0;         // instantaneous speed (see note)
+	rec.rx = 0; rec.tx = 0;         // instantaneous speed (filled by sample_rates)
 	return rec;
+}
+
+// Live per-client speed (B/s). A getter has no interval, so we persist the last
+// sample (per-MAC cumulative bytes + timestamp) and derive rate = delta/elapsed on
+// the next poll. The app polls get_list every few seconds, giving a real rate.
+// Wireless clients have byte counters (from iw); wired clients have none here, so
+// their speed stays 0 (would need per-MAC nft/conntrack accounting).
+const SAMPLE_FILE = "/tmp/gl-clients-sample.json";
+function sample_rates(clients) {
+	let now = time();
+	let prev = {}, prev_time = now;
+	let raw = fs.readfile(SAMPLE_FILE);
+	if (raw) {
+		let j = json(raw);
+		if (type(j) == "object") { prev = j.macs ?? {}; prev_time = int(j.time ?? now); }
+	}
+	let dt = now - prev_time;
+	let cur = {};
+	for (let c in clients) {
+		cur[c.mac] = { rx: c.total_rx, tx: c.total_tx };
+		if (dt > 0 && prev[c.mac]) {
+			let drx = c.total_rx - int(prev[c.mac].rx);
+			let dtx = c.total_tx - int(prev[c.mac].tx);
+			c.rx = (drx > 0) ? int(drx / dt) : 0;   // download B/s
+			c.tx = (dtx > 0) ? int(dtx / dt) : 0;   // upload B/s
+		}
+	}
+	fs.writefile(SAMPLE_FILE, sprintf("%J", { time: now, macs: cur }));
 }
 
 export default {
@@ -175,6 +203,7 @@ export default {
 				by_mac[mac] = enrich({ mac: mac, ip: lz[mac].ip, name: lz[mac].name, online: false }, wm[mac]);
 		let clients = [];
 		for (let mac in by_mac) push(clients, by_mac[mac]);
+		sample_rates(clients);   // fill live rx/tx (B/s) from inter-poll byte deltas
 		return { clients: clients };
 	},
 
