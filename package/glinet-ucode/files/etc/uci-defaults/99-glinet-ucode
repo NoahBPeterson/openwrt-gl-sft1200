@@ -1,9 +1,32 @@
 #!/bin/sh
-# First-boot wiring: serve /rpc from the gl-ucode handler on the existing uhttpd.
+# First-boot wiring for the GL.iNet ucode backend (runs once; idempotent), so a
+# clean flash / factory reset reproduces the full setup with no manual steps.
+
+# 1. Serve /rpc from the gl-ucode handler on the existing uhttpd 'main' instance.
 if uci -q get uhttpd.main >/dev/null; then
 	uci -q del_list uhttpd.main.ucode_prefix='/rpc=/usr/share/gl-ucode/handler.uc'
 	uci add_list uhttpd.main.ucode_prefix='/rpc=/usr/share/gl-ucode/handler.uc'
 	uci commit uhttpd
 fi
+
+# 2. Put the VPN + alternate-uplink interfaces in the wan firewall zone so LAN
+#    clients get NAT/masquerade + MSS clamping through whichever becomes the
+#    uplink (repeater STA, WireGuard, OpenVPN, cellular/USB tethering). Without
+#    this a repeater/VPN link comes up but shares no internet to clients.
+i=0
+while name=$(uci -q get firewall.@zone[$i].name); do
+	if [ "$name" = "wan" ]; then
+		for net in internet wgclient wgclient6 ovpnclient wwan tethering; do
+			uci -q del_list firewall.@zone[$i].network="$net"
+			uci add_list firewall.@zone[$i].network="$net"
+		done
+		uci -q set firewall.@zone[$i].masq='1'
+		uci -q set firewall.@zone[$i].mtu_fix='1'
+		uci commit firewall
+		break
+	fi
+	i=$((i+1))
+done
+
 mkdir -p /tmp/gl-ucode
 exit 0

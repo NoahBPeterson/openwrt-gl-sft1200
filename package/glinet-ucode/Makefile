@@ -20,9 +20,12 @@ define Package/glinet-ucode
   # uhttpd-mod-ucode gives the native ucode handler (preferred). It's a hard dep so
   # the production image bundles it; postinst still keeps a CGI fallback (/www/rpc)
   # in case a slimmed image drops the module.
+  # shadow-chpasswd: ui.set_password uses `chpasswd -c MD5`; busybox's chpasswd
+  # lacks -c, so the full shadow-utils chpasswd is required for onboarding.
   DEPENDS:= \
 	+uhttpd +uhttpd-mod-ucode \
-	+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-ubus +ucode-mod-digest
+	+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-ubus +ucode-mod-digest \
+	+shadow-chpasswd
   PKGARCH:=all
 endef
 
