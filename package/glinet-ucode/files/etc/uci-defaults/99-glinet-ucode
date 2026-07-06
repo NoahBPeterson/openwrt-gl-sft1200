@@ -1,0 +1,9 @@
+#!/bin/sh
+# First-boot wiring: serve /rpc from the gl-ucode handler on the existing uhttpd.
+if uci -q get uhttpd.main >/dev/null; then
+	uci -q del_list uhttpd.main.ucode_prefix='/rpc=/usr/share/gl-ucode/handler.uc'
+	uci add_list uhttpd.main.ucode_prefix='/rpc=/usr/share/gl-ucode/handler.uc'
+	uci commit uhttpd
+fi
+mkdir -p /tmp/gl-ucode
+exit 0

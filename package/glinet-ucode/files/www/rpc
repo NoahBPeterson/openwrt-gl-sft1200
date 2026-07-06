@@ -1,0 +1,31 @@
+#!/usr/bin/ucode
+// gl-ucode: uhttpd CGI endpoint for POST /rpc, used when uhttpd-mod-ucode (the
+// native ucode_prefix handler) is unavailable. Wire via uhttpd cgi_prefix so that
+// POST /rpc executes this file. Import path is relative to /www (this file's dir).
+'use strict';
+
+import { handle } from '../usr/share/gl-ucode/rpc.uc';
+
+const fs = require('fs');
+
+let len  = int(getenv("CONTENT_LENGTH") ?? "0");
+let body = (len > 0) ? (fs.stdin.read(len) ?? "") : (fs.stdin.read("all") ?? "");
+
+let remote = getenv("REMOTE_ADDR") ?? "";
+let reqinfo = {
+	remote_addr: remote,
+	is_local: (remote == "127.0.0.1" || remote == "::1"),
+	glinet: (getenv("HTTP_GLINET") != null),
+	token: (match(getenv("HTTP_COOKIE") ?? "", /Admin-Token=([^;]+)/) ? match(getenv("HTTP_COOKIE"), /Admin-Token=([^;]+)/)[1] : null)
+};
+
+let sink = {};
+let resp = handle(body, reqinfo, sink);
+
+print("Status: 200 OK\r\n");
+print("Content-Type: application/json\r\n");
+print("X-Frame-Options: DENY\r\n");
+if (sink.set_cookie)
+	print(`Set-Cookie: ${sink.set_cookie}\r\n`);
+print("\r\n");
+print(sprintf("%J", resp));
