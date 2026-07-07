@@ -20,31 +20,121 @@ function read_store(ctx, opt) {
 	return c.get("switch-button", "@main[0]", opt) ?? c.get("switch-button", "main", opt);
 }
 
+// Physical switch position. The hotplug handler writes it to /tmp/gl-switch-pos on
+// every flip; read that instead of polling /sys/kernel/debug/gpio (hammering that
+// debugfs crashes the out-of-tree siflower gpio driver). One safe fallback read if
+// the file is missing (no flip since boot).
+function switch_on(ctx) {
+	let v = fs.readfile("/tmp/gl-switch-pos");
+	if (v != null) return trim(v) == "1";
+	let g = ctx.popen("grep -m1 mode /sys/kernel/debug/gpio 2>/dev/null");
+	return (g && match(g, / in  lo/)) ? true : false;   // active-low: lo == on position
+}
+
+// Is the currently-bound function active right now?
+function func_active(ctx, func) {
+	if (func == "wireguard" || func == "vpn")
+		return ctx.popen("ip link show wgclient 2>/dev/null") ? true : false;
+	if (func == "openvpn")
+		return ctx.popen("ip link show ovpnclient 2>/dev/null") ? true : false;
+	if (func == "repeater") {
+		let s = ctx.ubus.call("network.interface.internet", "status") ?? {};
+		return s.up ? true : false;
+	}
+	if (func == "wifi") {
+		let d = ctx.ubus.call("network.wireless", "status") ?? {};
+		for (let r in d)
+			for (let i in (d[r].interfaces ?? [])) {
+				let cfg = i.config ?? {};
+				if (cfg.mode == "ap" && i.ifname) return true;
+			}
+		return false;
+	}
+	if (func == "adguardhome")
+		return ctx.popen("pgrep -f AdGuardHome 2>/dev/null") ? true : false;
+	if (func == "tor")
+		return ctx.popen("pgrep -x tor 2>/dev/null") ? true : false;
+	return false;
+}
+
 export default {
-	// Enumerate the functions the switch can be bound to. On mainline there are no
-	// /etc/gl-switch.d handler scripts to drive, so nothing is bindable.
-	// DEGRADE: original scanned /etc/gl-switch.d and cross-read wireless/route_policy/modem;
-	// all absent here -> empty list. Field name/shape ({funcs:[{func,sub_func?}]}) preserved.
+	// Enumerate the functions the mode button can be bound to, as the app's picker
+	// (ToggleBtnFuncM: {func, sub_func:[options]}). We advertise what /etc/hotplug.d/
+	// button/30-gl-toggle can actually enforce on this device, checking availability.
 	get_funcs: function(args, ctx) {
-		return { funcs: [] };
+		let c = ctx.uci.cursor();
+		let funcs = [];
+
+		// wifi: toggle a radio's broadcast. Offer only the bands with a radio present.
+		let bands = [];
+		c.foreach("wireless", "wifi-device", function(s) {
+			if (s.band == "2g" && index(bands, "2g") < 0) push(bands, "2g");
+			if (s.band == "5g" && index(bands, "5g") < 0) push(bands, "5g");
+		});
+		if (length(bands) > 0) push(funcs, { func: "wifi", sub_func: bands });
+
+		// vpn: the app renders the protocol directly (func "wireguard"/"openvpn"), NOT a
+		// "vpn" parent. Offer each protocol we have a saved config for.
+		let has = false;
+		c.foreach("wireguard", "peers", function(s) { has = true; });
+		if (has) push(funcs, { func: "wireguard", sub_func: [] });
+		has = false;
+		c.foreach("ovpnclient", "clients", function(s) { has = true; });
+		if (has) push(funcs, { func: "openvpn", sub_func: [] });
+
+		// repeater: toggle the uplink STA (present whenever a wifi-iface mode=sta exists
+		// or can be created -> always offered on this dual-radio device).
+		push(funcs, { func: "repeater", sub_func: [] });
+
+		// adguardhome: toggle network-wide ad/tracker blocking, if the binary is present.
+		if (fs.access("/usr/bin/AdGuardHome"))
+			push(funcs, { func: "adguardhome", sub_func: [] });
+
+		// tor: toggle transparent Tor routing, if the binary is present.
+		if (ctx.popen("command -v tor 2>/dev/null"))
+			push(funcs, { func: "tor", sub_func: [] });
+
+		// led: toggle the status LEDs, if any are software-controllable.
+		let leds = ctx.popen("ls /sys/class/leds 2>/dev/null");
+		if (leds && trim(leds) != "") push(funcs, { func: "led", sub_func: [] });
+
+		return { funcs: funcs };
 	},
 
 	// Return the currently bound function from our store. func enum values from the Lua:
 	// "none", "main_wifi", "guest_wifi", "wifi", "vpn", "cellular", "tor", "adguardhome",
 	// "repeater", "led" (plus dynamic vpn tunnel ids). Default "none" when unset.
 	get_config: function(args, ctx) {
+		let func = read_store(ctx, "func") ?? "none";
 		return {
-			func: read_store(ctx, "func") ?? "none",
-			sub_func: read_store(ctx, "sub_func")
+			func: func,
+			sub_func: read_store(ctx, "sub_func"),
+			listen: (func != "none")            // a function is bound to the switch
 		};
 	},
 
-	// Whether the physical switch position matches the web/service state.
-	// DEGRADE: the SF1688 exposes no usable switch and the per-func web-state cross-reads
-	// (vpn/tor/adguardhome/wifi/repeater/cellular/led) were dropped, so there is nothing to
-	// compare -> always in sync. Field name (sync_status) preserved.
+	// Whether the physical switch position matches the bound function's live state.
+	// sync_status 1 == in sync (switch position and service agree), 0 == out of sync
+	// (e.g. switch flipped ON but the VPN isn't up) -> the app offers a "sync" action.
 	check_sync_status: function(args, ctx) {
-		return { sync_status: 1 };
+		let func = read_store(ctx, "func") ?? "none";
+		if (func == "none") return { sync_status: 1 };
+		let want = switch_on(ctx);
+		let have = func_active(ctx, func);
+		return { sync_status: (want == have) ? 1 : 0, switch_on: want, active: have };
+	},
+
+	// Apply the physical switch position to the bound function NOW (the app's "sync"
+	// action when out of sync). Reuses the one hotplug handler so enforcement lives in
+	// a single place. User-triggered, not polled.
+	sync: function(args, ctx) {
+		let func = read_store(ctx, "func") ?? "none";
+		let sub = read_store(ctx, "sub_func");
+		if (func != "none") {
+			let action = switch_on(ctx) ? "pressed" : "released";
+			ctx.popen(`BUTTON=BTN_0 ACTION=${action} SEEN=1 sh /etc/hotplug.d/button/30-gl-toggle >/dev/null 2>&1`);
+		}
+		return { func: func, sub_func: sub, listen: (func != "none") };
 	},
 
 	// Store the chosen binding. Validates types, writes our own switch-button uci, then
@@ -62,7 +152,11 @@ export default {
 			return ctx.util.E.INVALID_PARAMS;
 
 		let c = ctx.uci.cursor();
-		// ensure the section exists (creates /etc/config/switch-button on commit if absent)
+		// The uci cursor cannot create a config that has no backing file, so touch it first.
+		if (!fs.access("/etc/config/switch-button")) {
+			let f = fs.open("/etc/config/switch-button", "w");
+			if (f) f.close();
+		}
 		c.set("switch-button", "main", "main");
 		c.set("switch-button", "main", "func", func);
 		c.delete("switch-button", "main", "sub_func");
