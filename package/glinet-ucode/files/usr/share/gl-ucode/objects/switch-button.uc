@@ -50,8 +50,15 @@ function func_active(ctx, func) {
 			}
 		return false;
 	}
-	if (func == "adguardhome")
-		return ctx.popen("pgrep -f AdGuardHome 2>/dev/null") ? true : false;
+	if (func == "adguardhome") {
+		// PRIMARY (adblock-fast): active == its run-state file is present in /dev/shm.
+		if (fs.access("/etc/init.d/adblock-fast"))
+			return fs.access("/dev/shm/adblock-fast") ? true : false;
+		// FALLBACK (our impl): active == the dnsmasq blocklist is wired in.
+		let ah = ctx.uci.cursor().get("dhcp", "@dnsmasq[0]", "addnhosts");
+		if (type(ah) == "array") { for (let h in ah) if (index(h, "gl-adblock") >= 0) return true; return false; }
+		return (type(ah) == "string" && index(ah, "gl-adblock") >= 0) ? true : false;
+	}
 	if (func == "tor")
 		return ctx.popen("pgrep -x tor 2>/dev/null") ? true : false;
 	return false;
@@ -65,16 +72,12 @@ export default {
 		let c = ctx.uci.cursor();
 		let funcs = [];
 
-		// wifi: toggle a radio's broadcast. Offer only the bands with a radio present.
-		let bands = [];
-		c.foreach("wireless", "wifi-device", function(s) {
-			if (s.band == "2g" && index(bands, "2g") < 0) push(bands, "2g");
-			if (s.band == "5g" && index(bands, "5g") < 0) push(bands, "5g");
-		});
-		if (length(bands) > 0) push(funcs, { func: "wifi", sub_func: bands });
+		// The app's Toggle Button page ONLY renders these func values (it has branches
+		// for wireguard/openvpn/repeater/tor/adguardhome); any other value -- wifi, led,
+		// nas, cellular, "vpn" -- is silently dropped. So advertise only from this set.
 
-		// vpn: the app renders the protocol directly (func "wireguard"/"openvpn"), NOT a
-		// "vpn" parent. Offer each protocol we have a saved config for.
+		// wireguard / openvpn: the app renders the protocol directly. Offer each we have
+		// a saved config for.
 		let has = false;
 		c.foreach("wireguard", "peers", function(s) { has = true; });
 		if (has) push(funcs, { func: "wireguard", sub_func: [] });
@@ -82,21 +85,19 @@ export default {
 		c.foreach("ovpnclient", "clients", function(s) { has = true; });
 		if (has) push(funcs, { func: "openvpn", sub_func: [] });
 
-		// repeater: toggle the uplink STA (present whenever a wifi-iface mode=sta exists
-		// or can be created -> always offered on this dual-radio device).
+		// repeater: toggle the uplink STA (always available on this dual-radio device).
 		push(funcs, { func: "repeater", sub_func: [] });
 
-		// adguardhome: toggle network-wide ad/tracker blocking, if the binary is present.
-		if (fs.access("/usr/bin/AdGuardHome"))
+		// adguardhome: ad/tracker blocking, LIGHT (no Go AdGuardHome). Offer it when the
+		// backend exists: adblock-fast (preferred package) OR our pre-built fallback list.
+		// Never advertise a toggle that can't act (an on-flip 4 MB download would hang).
+		if (fs.access("/etc/init.d/adblock-fast") ||
+		    fs.access("/usr/share/gl-ucode/gl-adblock.hosts") || fs.access("/etc/gl-ucode/gl-adblock.hosts"))
 			push(funcs, { func: "adguardhome", sub_func: [] });
 
-		// tor: toggle transparent Tor routing, if the binary is present.
+		// tor: transparent Tor routing, if the tor binary is present (C, light).
 		if (ctx.popen("command -v tor 2>/dev/null"))
 			push(funcs, { func: "tor", sub_func: [] });
-
-		// led: toggle the status LEDs, if any are software-controllable.
-		let leds = ctx.popen("ls /sys/class/leds 2>/dev/null");
-		if (leds && trim(leds) != "") push(funcs, { func: "led", sub_func: [] });
 
 		return { funcs: funcs };
 	},

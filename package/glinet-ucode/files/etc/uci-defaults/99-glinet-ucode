@@ -28,5 +28,26 @@ while name=$(uci -q get firewall.@zone[$i].name); do
 	i=$((i+1))
 done
 
+# 3. If adblock-fast is installed, prime it to back the switch-button "adguardhome"
+#    toggle: enable one compact list source + the safe dnsmasq.servers (NXDOMAIN,
+#    blocks A+AAAA) backend, and keep compressed cache so the list survives reboots.
+#    Master `enabled` stays 0 — the mode switch / app toggles activation on demand.
+if [ -f /etc/config/adblock-fast ]; then
+	#    1Hosts - Lite is a compact list (good coverage, low RAM) -- right for this
+	#    113 MB router; Hagezi Pro (~150k) left only ~13 MB free.
+	i=0
+	while name=$(uci -q get adblock-fast.@file_url[$i].name); do
+		case "$name" in
+			"1Hosts - Lite") uci -q set adblock-fast.@file_url[$i].enabled='1' ;;
+			"Hagezi - Pro")  uci -q set adblock-fast.@file_url[$i].enabled='0' ;;
+		esac
+		i=$((i+1))
+	done
+	uci -q set adblock-fast.config.dns='dnsmasq.servers'
+	uci -q set adblock-fast.config.compressed_cache='1'
+	uci -q set adblock-fast.config.enabled='0'
+	uci commit adblock-fast
+fi
+
 mkdir -p /tmp/gl-ucode
 exit 0

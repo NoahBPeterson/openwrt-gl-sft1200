@@ -69,18 +69,29 @@ repeater)
 	[ "$on" = 0 ] && rpc '{"jsonrpc":"2.0","id":1,"method":"call","params":["x","repeater","disconnect",{}]}' >/dev/null
 	;;
 adguardhome)
-	# ON: run AdGuardHome (DNS on 127.0.0.1:3053) and route LAN DNS through it.
-	if [ "$on" = 1 ]; then
-		/etc/init.d/adguardhome enable 2>/dev/null; /etc/init.d/adguardhome start 2>/dev/null
-		uci -q del_list dhcp.@dnsmasq[0].server='127.0.0.1#3053'
-		uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#3053'
-		uci -q set dhcp.@dnsmasq[0].noresolv='1'
-		uci commit dhcp; /etc/init.d/dnsmasq restart 2>/dev/null
+	# Ad/tracker blocking, LIGHT (no Go AdGuardHome).
+	# PRIMARY: adblock-fast -- the maintained OpenWrt package. It RAM-budgets + throttles
+	# downloads, blocks A+AAAA via server=/domain/ (NXDOMAIN), and heartbeat-polls dnsmasq
+	# back up after its async restart. We audited it against our own impl and it wins.
+	# FALLBACK (our reference impl, kept deliberately): a pre-built dnsmasq addnhosts
+	# blocklist with explicit 0.0.0.0 (A) + :: (AAAA) entries -- used only if adblock-fast
+	# isn't installed.
+	if [ -x /etc/init.d/adblock-fast ]; then
+		if [ "$on" = 1 ]; then
+			uci -q set adblock-fast.config.enabled='1'; uci -q commit adblock-fast
+			/etc/init.d/adblock-fast start >/dev/null 2>&1
+		else
+			/etc/init.d/adblock-fast stop >/dev/null 2>&1
+			uci -q set adblock-fast.config.enabled='0'; uci -q commit adblock-fast
+		fi
 	else
-		uci -q del_list dhcp.@dnsmasq[0].server='127.0.0.1#3053'
-		uci -q delete dhcp.@dnsmasq[0].noresolv
-		uci commit dhcp; /etc/init.d/dnsmasq restart 2>/dev/null
-		/etc/init.d/adguardhome stop 2>/dev/null; /etc/init.d/adguardhome disable 2>/dev/null
+		LIST=/usr/share/gl-ucode/gl-adblock.hosts
+		[ -s "$LIST" ] || LIST=/etc/gl-ucode/gl-adblock.hosts
+		[ -s "$LIST" ] || exit 0
+		uci -q del_list dhcp.@dnsmasq[0].addnhosts="$LIST"
+		[ "$on" = 1 ] && uci add_list dhcp.@dnsmasq[0].addnhosts="$LIST"
+		uci commit dhcp
+		/etc/init.d/dnsmasq restart 2>/dev/null
 	fi
 	;;
 tor)

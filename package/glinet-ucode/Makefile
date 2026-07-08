@@ -22,10 +22,13 @@ define Package/glinet-ucode
   # in case a slimmed image drops the module.
   # shadow-chpasswd: ui.set_password uses `chpasswd -c MD5`; busybox's chpasswd
   # lacks -c, so the full shadow-utils chpasswd is required for onboarding.
+  # adblock-fast: backs the switch-button "adguardhome" toggle with a light dnsmasq
+  # blocklist (the maintained package; the handler falls back to our own list if absent).
   DEPENDS:= \
 	+uhttpd +uhttpd-mod-ucode \
 	+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-ubus +ucode-mod-digest \
-	+shadow-chpasswd
+	+shadow-chpasswd \
+	+adblock-fast
   PKGARCH:=all
 endef
 
