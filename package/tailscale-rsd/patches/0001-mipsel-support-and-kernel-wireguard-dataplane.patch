@@ -1,0 +1,767 @@
+From e6cec45ef8e34e55169fdce99b3ed29644054b39 Mon Sep 17 00:00:00 2001
+From: Noah Peterson <noahbpeterson1997@gmail.com>
+Date: Sat, 11 Jul 2026 13:09:22 -0500
+Subject: [PATCH 1/2] feat: 32-bit mipsel (GL-SFT1200) support +
+ kernel-WireGuard hybrid dataplane
+
+Everything to build and run on 32-bit `mipsel-unknown-linux-musl` (the GL-SFT1200
+router), plus the kernel-WireGuard hybrid data path that makes Tailscale
+performant on a weak MIPS CPU.
+
+Portability (makes it compile on 32-bit):
+- ts_metrics: route `AtomicU64` through `portable-atomic`. 32-bit mipsel has no
+  native 64-bit atomic instructions (`core::sync::atomic` lacks `AtomicU64`); the
+  `fallback` feature synthesizes it via a lock over the native pointer-width CAS.
+
+Kernel-WireGuard hybrid data plane (feature `kernel-wg`, OFF by default, WIP):
+- `ts_runtime/kernel_wg.rs` + a dataplane seam: mirror peers that have a DIRECT
+  underlay endpoint into a kernel wg interface via netlink (`defguard_wireguard_rs`)
+  so the kernel does their crypto and sends UDP direct (far cheaper on 32-bit MIPS);
+  relay-only peers stay on the userspace `ts_tunnel` + DERP path. Needs root +
+  `kmod-wireguard` on-device; validated on-device, not in CI.
+- First cut: interface name/key/port via `TS_KERNEL_WG_{IFNAME,KEYFILE,PORT}` env;
+  the disco->kernel endpoint feed (seam #2) is not wired yet.
+
+Build recipe + device daemon:
+- `scripts/build-mipsel.sh` + `BUILD_MIPSEL.md`: reproducible tier-3 cross-build
+  (nightly + `-Z build-std`, musl cross toolchain; `link-self-contained=no` +
+  `panic=abort` + a `libunwind`->`libgcc_eh` shim resolve the crt/`-lunwind` linkage).
+- `examples/glinet_tsd`: a persistent (non-ephemeral) daemon for the GL-SFT1200
+  that publishes a status JSON the GL.iNet ucode app reads (login URL / IP / state).
+
+Also: peer_ping allows plaintext `GET /key` for a self-hosted `http://` control
+plane (dev Headscale); no effect on the default https Tailscale control plane.
+
+Signed-off-by: Noah Peterson <noahbpeterson1997@gmail.com>
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .gitignore                  |   3 +
+ BUILD_MIPSEL.md             |  86 ++++++++++++++++++++
+ Cargo.lock                  |  61 ++++++++++++++
+ Cargo.toml                  |  10 +++
+ examples/glinet_tsd/main.rs | 154 ++++++++++++++++++++++++++++++++++++
+ examples/peer_ping/main.rs  |   7 ++
+ scripts/build-mipsel.sh     |  31 ++++++++
+ ts_runtime/Cargo.toml       |   6 ++
+ ts_runtime/src/dataplane.rs |  61 ++++++++++++++
+ ts_runtime/src/kernel_wg.rs | 128 ++++++++++++++++++++++++++++++
+ ts_runtime/src/lib.rs       |   5 ++
+ 11 files changed, 552 insertions(+)
+ create mode 100644 BUILD_MIPSEL.md
+ create mode 100644 examples/glinet_tsd/main.rs
+ create mode 100755 scripts/build-mipsel.sh
+ create mode 100644 ts_runtime/src/kernel_wg.rs
+
+diff --git a/.gitignore b/.gitignore
+index bd244a6..99a4932 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -36,3 +36,6 @@ docs/GOAL.md
+ docs/research/
+ docs/AUTOPILOT-WORKLOG.md
+ docs/DEFERRED-QUESTIONS.md
++
++# mipsel cross-build CARGO_HOME cache (scripts/build-mipsel.sh)
++.cargo-home-mipsel/
+diff --git a/BUILD_MIPSEL.md b/BUILD_MIPSEL.md
+new file mode 100644
+index 0000000..533621a
+--- /dev/null
++++ b/BUILD_MIPSEL.md
+@@ -0,0 +1,86 @@
++# Building GeiserX for the GL-SFT1200 (mipsel, soft-float)
++
++Cross-compiles the `peer_ping` example (and the `tailscale` lib) for the GL-SFT1200 travel
++router — `mipsel-unknown-linux-musl`, **soft-float**, MIPS32r2, statically linked. Verified
++2026-07-10: `Finished release in 2m07s` (after the one-time build-std warm-up), 8.45 MB static
++binary, `FP ABI: Soft float`.
++
++Ready-to-run: [`scripts/build-mipsel.sh`](scripts/build-mipsel.sh).
++
++## Float ABI — the thing to get right
++Rust's `mipsel-unknown-linux-musl` target is **`+soft-float`** (`features: "+mips32r2,+soft-float"`,
++o32). It must be paired with a **soft-float** musl C toolchain for `ring`'s C/asm and the final
++link. Do **not** use the OpenWrt `mipsel_24kc+24kf` toolchain — despite living on the same device,
++it is built **hard-float** (`FP ABI: Hard float`, `-mhard-float`), so pairing it with Rust's
++soft-float objects is a float-ABI mismatch. We use the musl.cc `mipsel-linux-muslsf-cross`
++toolchain. A fully-static soft-float binary runs fine on the hard-float device (static =
++self-contained), and soft-float FP cost is negligible here: the heavy crypto rides the **kernel-wg**
++path (kernel does it), so the userspace binary barely touches floating point.
++
++Confirm the output: `readelf -A peer_ping` → `FP ABI: Soft float`, `MIPS32 rel2`.
++
++## Toolchain
++```sh
++curl -fsSL https://musl.cc/mipsel-linux-muslsf-cross.tgz | tar xz -C /opt
++# gcc 11.2.1, ships its unwinder as libgcc_eh.a
++```
++
++## The build recipe
++Tier-3 target ⇒ nightly + `-Z build-std`. The blocker is the **musl unwind/crt linkage**, fixed
++three ways (all in `scripts/build-mipsel.sh`):
++
++1. **`-C link-self-contained=no`** — under `-Z build-std` Rust does not emit its self-contained
++   `crt*.o`; let the cross-gcc sysroot supply `crt1/crti/crtbegin/crtend/crtn`.
++2. **`panic=abort`** (`CARGO_PROFILE_RELEASE_PANIC=abort` + `-Z build-std=std,panic_abort`) — drop
++   the unwinder. (`panic_immediate_abort` is now a hard error on current nightly; plain `abort` is
++   enough.)
++3. **`ln -sf libgcc_eh.a libunwind.a`** in the gcc libdir — Rust's musl std still
++   `#[link(name = "unwind")]`s even under panic=abort; muslsf ships the ABI-compatible unwinder as
++   `libgcc_eh.a`. Symlink (not a RUSTFLAG) so the compile cache is preserved and only the final link
++   re-runs.
++
++Plus the one source change (**already in the kernel-wg WIP**): `ts_metrics` uses
++`portable_atomic::AtomicU64` (32-bit mipsel has no native 64-bit atomics; keep the `fallback`
++feature).
++
++## Build target
++The root crate `geiserx_tailscale` is **lib-only** (`[lib] name = "tailscale"`) — there is no
++`tailscale` bin. The runnable is the **`peer_ping` example** (tailnet join / registration smoke
++test; no `required-features`):
++
++```sh
++cargo +nightly build --release --target mipsel-unknown-linux-musl \
++  -Z build-std=std,panic_abort \
++  -p geiserx_tailscale --example peer_ping --features kernel-wg
++# -> target/mipsel-unknown-linux-musl/release/examples/peer_ping
++```
++
++## On-device result (2026-07-10)
++`peer_ping` cross-built here **joined a real tailnet from a GL-SFT1200**: registered with
++`controlplane.tailscale.com`, completed the interactive login, pulled a netmap, selected DERP,
++and brought up the kernel-WireGuard interface `wg-ts` (hybrid dataplane). Notes:
++- **Soft-float binary runs fine** on the hard-float device (static = self-contained).
++- **Uplink matters:** a weak 5 GHz repeater link at 60% packet loss made the control stream
++  unholdable; 2.4 GHz (-43 dBm, 0% loss) was solid. Not a client bug — the environment.
++- **`wg-ts` shows no address with a placeholder `--peer`** — expected: the hybrid rule only
++  puts *direct-endpoint* peers on the kernel path; the node's own traffic uses the userspace
++  netstack.
++
++## Fix applied: followup 410 must re-register, not die (control_runner.rs)
++The interactive login was killing the runner: when the user **approves**, control **consumes the
++auth path**, and the very next followup poll returns `410 "auth path not found"`. The catch-all
++`Err(e)` arm classified that as a terminal `Internal(Http, Registration)` and stopped the runner —
++so the user's *own approval* aborted the login. Patch (in the `on_start` poll loop): when
++`login_url.is_some()` and the error is `Internal(Http, Registration)`, **drop the followup
++(`login_url = None`) and `continue`** — re-register once. An approved key then returns
++`MachineAuthorized` (`Ok(())` → login completes); an expired one returns a fresh AuthURL. Bounded
++(no infinite loop: on re-register `login_url` is None, so a repeat error is terminal). Verified
++end-to-end on device: approval → `re-registering` → `registered, starting netmap stream` →
++connected.
++
++## R_MIPS_JALR — not a factor here
++The `R_MIPS_JALR` relocation bug (LLVM leaks the `\x01` no-mangle prefix into the jalr hint symbol →
++phantom undefined symbol) only fires when **`aws-lc-sys`** is in the graph, i.e. `--features ssh`.
++The default/`kernel-wg` graph is **ring-only + pure-Rust netlink**, so it never appears. If you ever
++enable `ssh`, the workaround is `RUSTFLAGS="-C relocation-model=static"` (non-PIC emits a direct
++`jal`/`R_MIPS_26`, no jalr hint, no `\x01` symbol).
+diff --git a/Cargo.lock b/Cargo.lock
+index 1be060d..f5905c0 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1196,6 +1196,27 @@ version = "2.11.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+ 
++[[package]]
++name = "defguard_wireguard_rs"
++version = "0.7.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "27cfd58a0c9e3338235404b81cebdd9c709b33bbfe9451d602fe0d8747601db9"
++dependencies = [
++ "base64 0.22.1",
++ "libc",
++ "log",
++ "netlink-packet-core",
++ "netlink-packet-generic",
++ "netlink-packet-route 0.25.1",
++ "netlink-packet-utils",
++ "netlink-packet-wireguard",
++ "netlink-sys",
++ "nix 0.30.1",
++ "serde",
++ "thiserror 2.0.19",
++ "x25519-dalek 2.0.1",
++]
++
+ [[package]]
+ name = "defmt"
+ version = "0.3.100"
+@@ -2377,6 +2398,7 @@ version = "0.43.0"
+ dependencies = [
+  "base64 0.22.1",
+  "chrono",
++ "defguard_wireguard_rs",
+  "ed25519-dalek 2.2.0",
+  "etherparse",
+  "futures",
+@@ -3644,6 +3666,15 @@ dependencies = [
+  "paste",
+ ]
+ 
++[[package]]
++name = "netlink-packet-generic"
++version = "0.4.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2f891b2e0054cac5a684a06628f59568f841c93da4e551239da6e518f539e775"
++dependencies = [
++ "netlink-packet-core",
++]
++
+ [[package]]
+ name = "netlink-packet-route"
+ version = "0.25.1"
+@@ -3668,6 +3699,29 @@ dependencies = [
+  "netlink-packet-core",
+ ]
+ 
++[[package]]
++name = "netlink-packet-utils"
++version = "0.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3176f18d11a1ae46053e59ec89d46ba318ae1343615bd3f8c908bfc84edae35c"
++dependencies = [
++ "byteorder",
++ "pastey",
++ "thiserror 2.0.19",
++]
++
++[[package]]
++name = "netlink-packet-wireguard"
++version = "0.2.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "598962d9067d3153a00106da10e7b8276cea68f396f4a22f5b4a079270d92e29"
++dependencies = [
++ "libc",
++ "log",
++ "netlink-packet-core",
++ "netlink-packet-generic",
++]
++
+ [[package]]
+ name = "netlink-sys"
+ version = "0.8.8"
+@@ -4011,6 +4065,12 @@ version = "1.0.15"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+ 
++[[package]]
++name = "pastey"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
++
+ [[package]]
+ name = "pbkdf2"
+ version = "0.13.0"
+@@ -7263,6 +7323,7 @@ checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+ dependencies = [
+  "curve25519-dalek 4.1.3",
+  "rand_core 0.6.4",
++ "serde",
+  "zeroize",
+ ]
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index 3133bfc..142132c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -80,6 +80,9 @@ chacha20poly1305 = "0.10"
+ chrono = { version = "0.4", default-features = false }
+ clap = { version = "4", features = ["derive"] }
+ crypto_box = "0.9"
++# Kernel-WireGuard backend (optional, `kernel-wg` feature): configures the OS kernel wg interface
++# via netlink for the hybrid data plane. Cross-compiles to mipsel (verified). Off by default.
++defguard_wireguard_rs = "0.7"
+ divan = "0.1"
+ flume = "0.12"
+ futures = { version = "0.3", default-features = false }
+@@ -329,6 +332,10 @@ axum = ["dep:axum"]
+ hyper = ["dep:hyper", "dep:hyper-util", "dep:tower-service"]
+ ssh = ["dep:russh", "dep:bytes", "dep:ratatui", "dep:pty-process", "dep:nix"]
+ tun = ["ts_runtime/tun"]
++# Kernel-WireGuard hybrid data plane (KERNEL_WG_DESIGN.md): mirrors direct-endpoint peers into a
++# kernel wg interface via netlink for kernel-speed crypto on weak CPUs (e.g. mipsel routers).
++# Off by default; forwards to `ts_runtime/kernel-wg`. Needs root + kmod-wireguard on-device.
++kernel-wg = ["ts_runtime/kernel-wg"]
+ # Enables the internal OS network-link monitor (`Config::network_monitor`): on a link change the
+ # runtime re-binds the underlay socket and re-probes connectivity (re-ping, immediate STUN,
+ # re-netcheck). Off by default (pure-engine posture); setting `Config::network_monitor` without this
+@@ -350,6 +357,9 @@ required-features = ["axum"]
+ [[example]]
+ name = "peer_ping"
+ 
++[[example]]
++name = "glinet_tsd"
++
+ [[example]]
+ name = "tcp_echo"
+ 
+diff --git a/examples/glinet_tsd/main.rs b/examples/glinet_tsd/main.rs
+new file mode 100644
+index 0000000..d6b4a53
+--- /dev/null
++++ b/examples/glinet_tsd/main.rs
+@@ -0,0 +1,154 @@
++//! GL.iNet persistent Tailscale daemon for the GL-SFT1200.
++//!
++//! Unlike the `peer_ping` demo this is a real service node: **non-ephemeral** (it does not vanish
++//! from the tailnet when the process stops), with a **persistent key/state file** (survives reboots
++//! — no re-login once approved), using the kernel-WireGuard dataplane (build `--features kernel-wg`).
++//! It takes no `--peer` and does not hold a console; it stays up and publishes a small **status JSON
++//! file** that the ucode `/rpc` backend (`tailscale.uc`) reads, so the GL.iNet app can show the login
++//! URL, the tailnet IP, and the connection state. Login flow: on first run it publishes
++//! `{"state":"NeedsLogin","login_url":…}`; the app shows the URL; on approval it reaches
++//! `{"state":"Running","ipv4":…}`.
++
++use std::{error::Error, path::PathBuf, time::Duration};
++
++use clap::Parser;
++use tailscale::{Config, Device, DeviceState};
++use tracing_subscriber::filter::LevelFilter;
++
++#[derive(clap::Parser)]
++#[command(version, about)]
++struct Args {
++    /// Persistent node key/state file (survives reboots -> reconnect without re-login).
++    #[arg(short = 'c', long, default_value = "/etc/tailscale-rs/node.json")]
++    key_file: PathBuf,
++
++    /// The hostname this node requests.
++    #[arg(short = 'H', long, default_value = "sft1200")]
++    hostname: Option<String>,
++
++    /// Optional auth key (interactive login is used if absent).
++    #[arg(short = 'k', long, env = "TS_AUTH_KEY")]
++    auth_key: Option<String>,
++
++    /// Status JSON file the ucode backend (`tailscale.uc`) reads.
++    #[arg(short = 's', long, default_value = "/var/run/tailscale-rs/status.json")]
++    status_file: PathBuf,
++
++    /// Control server URL (defaults to the Tailscale control plane).
++    #[arg(long, env = "TS_CONTROL_URL")]
++    control_url: Option<url::Url>,
++}
++
++/// Atomically publish the status JSON (write to a temp file + rename) so a concurrent reader in
++/// `tailscale.uc` never sees a half-written file.
++fn write_status(path: &PathBuf, value: &serde_json::Value) {
++    let tmp = path.with_extension("tmp");
++    if std::fs::write(&tmp, value.to_string()).is_ok()
++        && let Err(e) = std::fs::rename(&tmp, path)
++    {
++        tracing::warn!(error = %e, path = %path.display(), "could not publish status file");
++    }
++}
++
++#[tokio::main(flavor = "multi_thread")]
++async fn main() -> Result<(), Box<dyn Error>> {
++    // This binary *is* the early-days experimental client — self-acknowledge the runtime gate so
++    // the service init script does not have to carry the env var.
++    // SAFETY: single-threaded at this point (before the tokio runtime spawns worker tasks).
++    unsafe { std::env::set_var("TS_RS_EXPERIMENT", "this_is_unstable_software") };
++
++    tracing_subscriber::fmt()
++        .with_env_filter(
++            tracing_subscriber::EnvFilter::builder()
++                .with_default_directive(LevelFilter::INFO.into())
++                .from_env_lossy(),
++        )
++        .init();
++
++    let args = Args::parse();
++    if let Some(d) = args.key_file.parent() {
++        std::fs::create_dir_all(d).ok();
++    }
++    if let Some(d) = args.status_file.parent() {
++        std::fs::create_dir_all(d).ok();
++    }
++
++    let mut config = Config::default_with_key_file(&args.key_file).await?;
++    config.requested_hostname = args.hostname.clone();
++    config.ephemeral = false; // PERSISTENT: do not auto-remove this node when the process stops.
++    if let Some(url) = args.control_url {
++        config.control_server_url = url;
++        if config.control_server_url.scheme() == "http" {
++            config.allow_http_key_fetch = true;
++        }
++    }
++
++    // Supervise loop: (re)create the Device, watch it, and on a TERMINAL state
++    // (`Failed`/`Expired`) tear it down and retry with backoff. The runtime treats a transient
++    // boot-time network error ("control plane unreachable" — daemon started before the uplink/DNS
++    // were ready) as terminal, so without this the daemon would sit in `Failed` forever. Retrying
++    // the whole Device makes it self-heal once connectivity comes up, with no external nudge.
++    loop {
++        let dev = match Device::new(&config, args.auth_key.clone()).await {
++            Ok(d) => d,
++            Err(e) => {
++                write_status(
++                    &args.status_file,
++                    &serde_json::json!({ "state": "Failed", "error": e.to_string() }),
++                );
++                tracing::warn!(error = %e, "Device::new failed; retrying after backoff");
++                tokio::time::sleep(Duration::from_secs(10)).await;
++                continue;
++            }
++        };
++        let mut state_rx = dev.watch_state();
++
++        loop {
++            let state = state_rx.borrow_and_update().clone();
++            let status = match &state {
++                DeviceState::Connecting => serde_json::json!({ "state": "Connecting" }),
++                DeviceState::NeedsLogin(url) => {
++                    serde_json::json!({ "state": "NeedsLogin", "login_url": url.to_string() })
++                }
++                DeviceState::NeedsMachineAuth => serde_json::json!({ "state": "NeedsMachineAuth" }),
++                DeviceState::Reauthenticating => serde_json::json!({ "state": "Reauthenticating" }),
++                DeviceState::Expired => serde_json::json!({ "state": "Expired" }),
++                DeviceState::Failed(e) => {
++                    serde_json::json!({ "state": "Failed", "error": e.to_string() })
++                }
++                DeviceState::Running => {
++                    let (v4, v6) = dev
++                        .tailscale_ips()
++                        .await
++                        .map(|(a, b)| (a.to_string(), b.map(|x| x.to_string())))
++                        .unwrap_or_default();
++                    serde_json::json!({
++                        "state": "Running",
++                        "ipv4": v4,
++                        "ipv6": v6,
++                        "hostname": config.requested_hostname,
++                    })
++                }
++                // DeviceState is #[non_exhaustive]; surface any future variant rather than failing.
++                _ => serde_json::json!({ "state": format!("{state:?}") }),
++            };
++            write_status(&args.status_file, &status);
++            tracing::info!(?state, "tailscale status published");
++
++            // Terminal state -> drop the Device and recreate it (after the backoff below).
++            if matches!(state, DeviceState::Failed(_) | DeviceState::Expired) {
++                break;
++            }
++
++            // Wake on a state change, or refresh periodically (IPs/peers can change while Running).
++            tokio::select! {
++                _ = state_rx.changed() => {}
++                _ = tokio::time::sleep(Duration::from_secs(20)) => {}
++            }
++        }
++
++        drop(dev);
++        tracing::warn!("device reached a terminal state; recreating after backoff");
++        tokio::time::sleep(Duration::from_secs(10)).await;
++    }
++}
+diff --git a/examples/peer_ping/main.rs b/examples/peer_ping/main.rs
+index 7b33bde..9af92b4 100644
+--- a/examples/peer_ping/main.rs
++++ b/examples/peer_ping/main.rs
+@@ -57,6 +57,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
+         config.control_server_url = url;
+     }
+ 
++    // Allow the plaintext `GET /key` bootstrap when targeting a self-hosted control plane over
++    // http:// (e.g. a dev Headscale on a trusted LAN). No effect for the default https Tailscale
++    // control plane, where the key fetch is always https regardless.
++    if config.control_server_url.scheme() == "http" {
++        config.allow_http_key_fetch = true;
++    }
++
+     let dev = Device::new(&config, args.auth_key).await?;
+ 
+     let sock = dev.udp_bind((dev.ipv4_addr().await?, 1234).into()).await?;
+diff --git a/scripts/build-mipsel.sh b/scripts/build-mipsel.sh
+new file mode 100755
+index 0000000..f1a3b88
+--- /dev/null
++++ b/scripts/build-mipsel.sh
+@@ -0,0 +1,31 @@
++#!/bin/sh
++# GeiserX -> GL-SFT1200 (mipsel-unknown-linux-musl, SOFT-FLOAT) cross-build.
++# Rust mipsel-unknown-linux-musl is +soft-float; match it with a soft-float musl toolchain
++# (NOT the OpenWrt hard-float one). Heavy crypto rides the kernel-wg path, so soft-float FP
++# in the binary is a non-issue. Fixes the musl unwind/crt linkage (not R_MIPS_JALR, which is
++# aws-lc/ssh-only and not in this feature graph).
++set -eu
++export RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
++export RUSTUP_TOOLCHAIN=nightly
++
++TC=/opt/mipsel-linux-muslsf-cross
++CC="$TC/bin/mipsel-linux-muslsf-gcc"
++AR="$TC/bin/mipsel-linux-muslsf-ar"
++
++export CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER="$CC"
++export CC_mipsel_unknown_linux_musl="$CC"
++export AR_mipsel_unknown_linux_musl="$AR"
++# +crt-static (static musl) + link-self-contained=no (sysroot supplies crt*.o under build-std)
++export CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-self-contained=no"
++# drop the unwinder (panic=abort) so std does not need a real libunwind
++export CARGO_PROFILE_RELEASE_PANIC=abort
++
++# unwind shim: rust musl std still #[link(name=unwind)]s; muslsf ships it as libgcc_eh.a
++GCC_LIBDIR="$(dirname "$("$CC" -print-libgcc-file-name)")"
++[ -f "$GCC_LIBDIR/libunwind.a" ] || ln -sf "$GCC_LIBDIR/libgcc_eh.a" "$GCC_LIBDIR/libunwind.a"
++
++cd /home/builder/tailscale-rs-geiserx
++exec cargo +nightly build --release \
++  --target mipsel-unknown-linux-musl \
++  -Z build-std=std,panic_abort \
++  -p geiserx_tailscale --example peer_ping --features kernel-wg
+diff --git a/ts_runtime/Cargo.toml b/ts_runtime/Cargo.toml
+index a35bd7b..6b7af52 100644
+--- a/ts_runtime/Cargo.toml
++++ b/ts_runtime/Cargo.toml
+@@ -17,6 +17,8 @@ name = "ts_runtime"
+ # `StatusNode.last_seen` exposes a `chrono::DateTime<Utc>` on a public field (mirrors
+ # `ts_control::Node.last_seen` / Go `PeerStatus.LastSeen`). Already a transitive dep via `ts_control`.
+ chrono = { workspace = true }
++# Optional: kernel-WireGuard backend, pulled in only behind the `kernel-wg` feature (see below).
++defguard_wireguard_rs = { workspace = true, optional = true }
+ # Our crates.
+ ts_bart.workspace = true
+ ts_bart_packetfilter.workspace = true
+@@ -90,6 +92,10 @@ network-monitor = ["dep:ts_netmon"]
+ # `GetCertificate` message; a self-hosted control plane 501s on set-dns so issuance is
+ # non-functional there.
+ acme = ["ts_control/acme"]
++# Kernel-WireGuard hybrid data plane (KERNEL_WG_DESIGN.md seam #1). Mirrors direct-endpoint peers
++# into a kernel wg interface via netlink (defguard); relay-only peers stay on userspace+DERP. Needs
++# root + kmod-wireguard on-device. Off by default; cross-compiles to mipsel.
++kernel-wg = ["dep:defguard_wireguard_rs"]
+ 
+ [dev-dependencies]
+ proptest = "1.11"
+diff --git a/ts_runtime/src/dataplane.rs b/ts_runtime/src/dataplane.rs
+index 70917d1..af447f1 100644
+--- a/ts_runtime/src/dataplane.rs
++++ b/ts_runtime/src/dataplane.rs
+@@ -196,6 +196,67 @@ impl Message<Arc<PeerState>> for DataplaneActor {
+             }
+         }
+ 
++        // Hybrid data plane (KERNEL_WG_DESIGN.md seam #1): mirror peers that have a direct underlay
++        // endpoint into the kernel WireGuard interface so the kernel does their crypto + sends UDP
++        // direct (much cheaper on 32-bit MIPS). Relay-only / not-yet-direct peers are excluded by
++        // `kernel_wg::sync` and stay on the userspace ts_tunnel + DERP path above. First cut: the
++        // local interface name/key/port come from env (TS_KERNEL_WG_{IFNAME,KEYFILE,PORT}); the full
++        // integration threads the node's own WG key from config (see KERNEL_WG_DESIGN.md).
++        #[cfg(all(feature = "kernel-wg", target_os = "linux"))]
++        {
++            use defguard_wireguard_rs::net::IpAddrMask;
++
++            use crate::kernel_wg::{self, KernelPeer};
++
++            let ifname =
++                std::env::var("TS_KERNEL_WG_IFNAME").unwrap_or_else(|_| "wg-ts".to_string());
++            let port: u32 = std::env::var("TS_KERNEL_WG_PORT")
++                .ok()
++                .and_then(|s| s.parse().ok())
++                .unwrap_or(51820);
++            let privkey: [u8; 32] = std::env::var("TS_KERNEL_WG_KEYFILE")
++                .ok()
++                .and_then(|p| std::fs::read(p).ok())
++                .filter(|b| b.len() == 32)
++                .map(|b| {
++                    let mut k = [0u8; 32];
++                    k.copy_from_slice(&b);
++                    k
++                })
++                .unwrap_or([0u8; 32]);
++
++            let mut peers = Vec::new();
++            for &upsert in &msg.upserts {
++                let Some((_, node)) = msg.peers.get(&upsert) else {
++                    continue;
++                };
++                let mut allowed = vec![
++                    IpAddrMask::new(
++                        node.tailnet_address.ipv4.addr().into(),
++                        node.tailnet_address.ipv4.prefix_len(),
++                    ),
++                    IpAddrMask::new(
++                        node.tailnet_address.ipv6.addr().into(),
++                        node.tailnet_address.ipv6.prefix_len(),
++                    ),
++                ];
++                for r in &node.accepted_routes {
++                    allowed.push(IpAddrMask::new(r.addr(), r.prefix_len()));
++                }
++                peers.push(KernelPeer {
++                    public_key: node.node_key.to_bytes(),
++                    allowed_ips: allowed,
++                    // best_addr (disco-verified, seam #2) is not plumbed to this synchronous seam
++                    // yet, so pass None and use the control-distributed underlay candidate. The
++                    // periodic seam-#2 task (KERNEL_WG_DESIGN.md) will supply the live best_addr.
++                    endpoint: kernel_wg::select_endpoint(None, &node.underlay_addresses),
++                });
++            }
++            if let Err(e) = kernel_wg::sync(&ifname, privkey, port, &peers) {
++                tracing::warn!(error = %e, "kernel-wg: sync failed (needs root + kmod-wireguard)");
++            }
++        }
++
+         tracing::trace!("applied new peer state");
+     }
+ }
+diff --git a/ts_runtime/src/kernel_wg.rs b/ts_runtime/src/kernel_wg.rs
+new file mode 100644
+index 0000000..32c8c75
+--- /dev/null
++++ b/ts_runtime/src/kernel_wg.rs
+@@ -0,0 +1,128 @@
++//! Kernel-WireGuard backend for the hybrid data plane (KERNEL_WG_DESIGN.md, seam #1).
++//!
++//! Mirrors the tailnet peer set assembled at the dataplane `PeerState` seam into a kernel
++//! WireGuard interface via `defguard_wireguard_rs`. Hybrid rule: only peers with a direct underlay
++//! endpoint are placed on the kernel path (kernel does crypto + sends UDP direct, far cheaper on
++//! 32-bit MIPS); relay-only / not-yet-direct peers stay on the userspace `ts_tunnel` + DERP path.
++//!
++//! Off by default; built only with the `kernel-wg` cargo feature. The actual netlink ops require
++//! root + `kmod-wireguard` and are validated on-device, not in CI.
++use std::net::SocketAddr;
++
++use defguard_wireguard_rs::{
++    InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi, host::Peer, key::Key,
++    net::IpAddrMask,
++};
++
++/// One tailnet peer projected from a control `Node` at the dataplane seam.
++pub struct KernelPeer {
++    /// The peer's WireGuard public key (`Node.node_key`).
++    pub public_key: [u8; 32],
++    /// The peer's tailnet addresses + accepted routes (`Node.tailnet_address` / `accepted_routes`).
++    pub allowed_ips: Vec<IpAddrMask>,
++    /// Direct underlay endpoint (`Node.underlay_addresses`); `None` => relay-only, excluded.
++    pub endpoint: Option<SocketAddr>,
++}
++
++/// Pick the kernel-path endpoint for a peer: prefer the disco-verified direct address (`best_addr`,
++/// seam #2 — the live, NAT-traversed path) when present, else fall back to a control-distributed
++/// candidate from `Node.underlay_addresses` (seam #1). `None` => no direct path => relay-only =>
++/// the peer is excluded from the kernel path and stays on userspace `ts_tunnel` + DERP.
++pub fn select_endpoint(
++    best_addr: Option<SocketAddr>,
++    underlay_addresses: &[SocketAddr],
++) -> Option<SocketAddr> {
++    best_addr.or_else(|| underlay_addresses.first().copied())
++}
++
++/// Build the defguard interface config, applying the hybrid rule (direct-endpoint peers only).
++pub fn build_config(
++    ifname: &str,
++    private_key: [u8; 32],
++    listen_port: u32,
++    peers: &[KernelPeer],
++) -> InterfaceConfiguration {
++    let kernel_peers: Vec<Peer> = peers
++        .iter()
++        .filter(|p| p.endpoint.is_some())
++        .map(|p| {
++            let mut peer = Peer::new(Key::new(p.public_key));
++            peer.endpoint = p.endpoint;
++            peer.allowed_ips = p.allowed_ips.clone();
++            peer
++        })
++        .collect();
++
++    InterfaceConfiguration {
++        name: ifname.to_string(),
++        prvkey: Key::new(private_key).to_string(),
++        addresses: vec![],
++        port: listen_port,
++        peers: kernel_peers,
++        mtu: None,
++    }
++}
++
++/// Create (if needed) and configure the kernel wg interface for the given peer set. Real netlink —
++/// needs root + `kmod-wireguard` on the device.
++pub fn sync(
++    ifname: &str,
++    private_key: [u8; 32],
++    listen_port: u32,
++    peers: &[KernelPeer],
++) -> Result<(), defguard_wireguard_rs::error::WireguardInterfaceError> {
++    let cfg = build_config(ifname, private_key, listen_port, peers);
++    let wgapi = WGApi::<Kernel>::new(ifname.to_string())?;
++    // The interface may already exist (created by uci/`ip link`); an error here is non-fatal — we
++    // still attempt to configure it below.
++    if let Err(e) = wgapi.create_interface() {
++        tracing::debug!(error = %e, ifname, "kernel-wg: create_interface failed (may already exist)");
++    }
++    wgapi.configure_interface(&cfg)
++}
++
++#[cfg(test)]
++mod tests {
++    use std::net::Ipv4Addr;
++
++    use super::*;
++
++    fn cidr(a: [u8; 4], c: u8) -> IpAddrMask {
++        IpAddrMask::new(Ipv4Addr::from(a).into(), c)
++    }
++
++    #[test]
++    fn select_endpoint_prefers_disco_best_addr_then_falls_back() {
++        let underlay = ["198.51.100.7:41641".parse().unwrap()];
++        let best: SocketAddr = "203.0.113.9:41641".parse().unwrap();
++        // disco best_addr wins when present (seam #2: the live, verified direct path)
++        assert_eq!(select_endpoint(Some(best), &underlay), Some(best));
++        // else fall back to the control-distributed candidate (seam #1)
++        assert_eq!(select_endpoint(None, &underlay), Some(underlay[0]));
++        // relay-only peer: no endpoint at all => excluded from the kernel path
++        assert_eq!(select_endpoint(None, &[]), None);
++    }
++
++    #[test]
++    fn only_direct_endpoint_peers_reach_the_kernel() {
++        let peers = vec![
++            KernelPeer {
++                public_key: [1; 32],
++                allowed_ips: vec![cidr([100, 64, 0, 1], 32)],
++                endpoint: None,
++            },
++            KernelPeer {
++                public_key: [2; 32],
++                allowed_ips: vec![cidr([100, 64, 0, 2], 32)],
++                endpoint: Some("203.0.113.5:41641".parse().unwrap()),
++            },
++        ];
++        let cfg = build_config("wg-ts", [7; 32], 51820, &peers);
++        assert_eq!(cfg.peers.len(), 1);
++        assert_eq!(cfg.peers[0].public_key, Key::new([2; 32]));
++        assert_eq!(
++            cfg.peers[0].endpoint,
++            Some("203.0.113.5:41641".parse().unwrap())
++        );
++    }
++}
+diff --git a/ts_runtime/src/lib.rs b/ts_runtime/src/lib.rs
+index 6500db2..c733c49 100644
+--- a/ts_runtime/src/lib.rs
++++ b/ts_runtime/src/lib.rs
+@@ -23,6 +23,9 @@ pub mod capture;
+ pub mod control_runner;
+ mod dataplane;
+ mod derp_latency;
++// Kernel-WireGuard backend is Linux-only (it configures a kernel wg interface via netlink), so gate
++// on target_os as well: `--features kernel-wg` is a clean no-op on non-Linux hosts and fully active
++// on the mipsel router target.
+ /// Device connection-state tracking ([`DeviceState`]) and typed registration outcome
+ /// ([`RegistrationError`]).
+ pub mod device_state;
+@@ -40,6 +43,8 @@ pub mod funnel;
+ /// Unified IPN notification bus ([`Notify`] / [`watch_ipn_bus`](Runtime::watch_ipn_bus)), mirroring
+ /// Go `ipn` `LocalBackend.WatchNotifications` / the `WatchIPNBus` LocalAPI.
+ pub mod ipn_bus;
++#[cfg(all(feature = "kernel-wg", target_os = "linux"))]
++pub mod kernel_wg;
+ mod magic_dns;
+ pub use magic_dns::DnsQueryResult;
+ mod multiderp;

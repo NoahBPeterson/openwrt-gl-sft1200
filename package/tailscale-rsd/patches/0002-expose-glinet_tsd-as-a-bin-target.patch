@@ -1,0 +1,31 @@
+From ebe8de3ae3c45fa35e9b19959dabc72267f4ec9c Mon Sep 17 00:00:00 2001
+From: Noah Peterson <NoahBPeterson1997@gmail.com>
+Date: Wed, 29 Jul 2026 14:21:54 -0500
+Subject: [PATCH 2/2] packaging: expose glinet_tsd as a bin target for cargo
+ install
+
+OpenWrt's rust-package.mk builds with `cargo install --path`, which only picks up
+[[bin]] targets. Declare glinet_tsd as a bin (source unchanged, still under
+examples/) gated on required-features = ["kernel-wg"].
+---
+ Cargo.toml | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 142132c..dfbce3b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -357,8 +357,12 @@ required-features = ["axum"]
+ [[example]]
+ name = "peer_ping"
+ 
+-[[example]]
++# Built as a real binary (not an example) so `cargo install` picks it up when packaging for
++# OpenWrt; the source still lives under examples/ because it doubles as the embedder reference.
++[[bin]]
+ name = "glinet_tsd"
++path = "examples/glinet_tsd/main.rs"
++required-features = ["kernel-wg"]
+ 
+ [[example]]
+ name = "tcp_echo"
