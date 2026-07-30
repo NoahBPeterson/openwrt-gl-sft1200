@@ -35,6 +35,13 @@ include $(TOPDIR)/package/lang/rust/rust-package.mk
 # Hybrid data plane: kernel wg for direct peers, userspace + DERP for relayed ones.
 RUST_PKG_FEATURES:=kernel-wg
 
+# The daemon is an example, not a [[bin]]: it uses clap and tracing-subscriber, which upstream
+# carries as dev-dependencies (available to examples, not to bins). `cargo install --example`
+# installs it into $(PKG_INSTALL_DIR)/bin all the same.
+define Build/Compile
+	$(call Build/Compile/Cargo,,--example glinet_tsd)
+endef
+
 define Package/tailscale-rsd
   SECTION:=net
   CATEGORY:=Network
